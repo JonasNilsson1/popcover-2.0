@@ -21,10 +21,13 @@ def get_parser():
 
     parser.add_argument('-noco1', dest='p_noco1', action="store_true", help='MHC I binder data without binding cores')
     parser.add_argument('-noco2', dest='p_noco2', action="store_true", help='MHC II binder data without binding cores')
-    parser.add_argument('-selm', dest='p_method', default="popcover", help='Method of peptide selection')
+    parser.add_argument('-selm', dest='p_method', default="popcover", help='Method of peptide selection (options: popcover s_ini random)')
     parser.add_argument('-phf', dest='p_phenofreq', action="store_true", help='Use phenotype frequencies for calculation')
     parser.add_argument('-smin', dest='p_submin', action="store_true", help='Substract min. genomic coverage in score function denominator')
     parser.add_argument('-nore', dest='p_nore', action="store_true", help='Skip dataset reduction')
+    parser.add_argument('-req1', dest='p_req1', action="store_true", help='Require nested class I binder in selected peptides')
+    parser.add_argument('-req2', dest='p_req2', action="store_true", help='Require nested class II binder in selected peptides')
+    parser.add_argument('-iedb', dest='p_iedb', action="store_true", help='Use IEDB method for calculating coverage')
 
     return parser
 
@@ -41,6 +44,7 @@ def get_hlaref(hlafile):
     hlaref = dict()
 
     with open(hlafile) as infile:
+
         for line in infile:
 
             if not line.strip():
@@ -48,24 +52,53 @@ def get_hlaref(hlafile):
 
             items = line.rstrip().split()
 
-            if len(items) != 2:
+            if len(items) == 2:
+                hla, freq = items
+
+                try:
+                    freq = float(freq)
+                except ValueError:
+                    print(f"Error: invalid allele frequency: {freq}")
+                    sys.exit(1)
+
+                phenofreq = 2*freq - freq**2
+
+                hlaref[hla] = {'freq':freq, 'phenofreq':phenofreq, 'hits':0}
+
+                # Find the locus
+                locreg = re.search(r'(HLA-)?[ABC]|(HLA-)?D[A-Z]+[0-9]', hla)
+                if locreg is not None:
+                    locus = locreg.group(0)
+                    hlaref[hla]['locus'] = locus
+
+            elif len(items) == 4:
+                hla, locus, hla_class, freq = items
+
+                try:
+                    freq = float(freq)
+                    hla_class = int(hla_class)
+                except ValueError:
+                    print(f"Error: invalid allele frequency or hla_class: {hla_class} {freq}")
+                    sys.exit(1)
+
+                phenofreq = 2*freq - freq**2
+
+                try:
+                    hla_class = int(hla_class)
+                except ValueError:
+                    print("Error: invalid HLA class in reference file, must be either 1 or 2")
+                    sys.exit(1)
+
+                hlaref[hla] = {'freq':freq, 'phenofreq':phenofreq, 'hits':0, 'locus':locus, 'class':hla_class}
+
+            else:
                 print("Wrong line format in HLA reference file: ", line, '')
                 sys.exit(1)
 
-            hla, freq = items[0], float(items[1])
-            phenofreq = 2*freq - freq**2
-
-            hlaref[hla] = {'freq':freq, 'phenofreq':phenofreq}
-
-            # Currently DRB3, DRB4, DRB4 are treated as individual loci, which may artificially boost coverage
-            locreg = re.search(r'(HLA-)?[ABC]|(HLA-)?D[A-Z]+[0-9]', hla)
-            if locreg is not None:
-                locus = locreg.group(0)
-                hlaref[hla]['locus'] = locus
-
-    print("Got %d alleles from allele frequency list" % len(hlaref))
+    print(f"Got {len(hlaref)} alleles from allele frequency list")
 
     return hlaref
+
 
 
 def parse_input(filename, hlaref, no_cores=False, mhc2=False):
@@ -122,8 +155,12 @@ def parse_input(filename, hlaref, no_cores=False, mhc2=False):
 
             # Building the epitope data structure
             if pep not in epidict:
-                epidict[pep] = {'combos':{(hla, gen)}, 'hlaset':{hla}, 'genset':{gen}, 'covset':{(core, hla, gen)}}
+                epidict[pep] = {'combos':{(hla, gen)}, 'hlaset':{hla}, 'genset':{gen}, 'covset':{(core, hla, gen)}, 'nested':[0,0]}
 
+                if not mhc2:
+                    epidict[pep]['nested'][0] = 1
+                else:
+                    epidict[pep]['nested'][1] = 1
             else:
                 epidict[pep]['hlaset'].add(hla)
                 epidict[pep]['genset'].add(gen)
@@ -131,7 +168,7 @@ def parse_input(filename, hlaref, no_cores=False, mhc2=False):
                 epidict[pep]['covset'].add((core, hla, gen))
 
     if skipped_hla:
-        print("Skipped %d lines due to these HLAs not in allele frequency:" % s)
+        print(f"Skipped {s} lines due to these HLAs not in allele frequency:")
         print('\t'.join(skipped_hla))
         print("")
 
@@ -168,6 +205,10 @@ def reduce_dataset(epidict, peplist):
                 if substring:
                     for entry in ['hlaset', 'genset', 'combos', 'covset']:
                         unique_dict[uniq][entry] = unique_dict[uniq][entry].union(epidict[pep][entry])
+
+                    for i in (0,1):
+                        if epidict[pep]['nested'][i] == 1:
+                            unique_dict[uniq]['nested'][i] = 1
                 break
 
         # Add peptide to unique list
@@ -175,7 +216,7 @@ def reduce_dataset(epidict, peplist):
             unique_dict[pep] = epidict[pep]
 
     if len(unique_dict) < len(peplist):
-        print("Hobohm 1 dataset reduction yielded {} peptides, down from {}".format(len(unique_dict), len(peplist)))
+        print(f"Hobohm 1 dataset reduction yielded {len(unique_dict)} peptides, down from {len(peplist)}")
         print("")
 
     return unique_dict
@@ -188,7 +229,7 @@ def calculate_hla_coverage(covered_hlas, hlaref):
 
     for hla in covered_hlas:
 
-        if 'locus' in hlaref[hla] and 'freq' in hlaref[hla]:
+        if 'locus' in hlaref[hla]:
             locus = hlaref[hla]['locus']
 
             if locus not in locidict:
@@ -197,23 +238,24 @@ def calculate_hla_coverage(covered_hlas, hlaref):
                 locidict[locus].append(hla)
 
     # Calculate within loci coverage
-    coverages = {"MHC Class I":{}, 'MHC Class II':{}}
-    for locus in sorted(locidict):
-
+    coverages = {}
+    for locus in locidict:
         mhc_class = hlaref[locidict[locus][0]]['class']
 
         uncov = 1
         for hla in locidict[locus]:
             uncov *= (1 - hlaref[hla]['phenofreq'])
-        
         cov = 1 - uncov
 
-        mhc = "MHC Class I" if mhc_class == 1 else 'MHC Class II'
+        mhc = f"MHC class {'I'*mhc_class}"
+
+        if mhc not in coverages:
+            coverages[mhc] = {}
 
         coverages[mhc][locus] = cov
 
     # Calculate across loci coverage
-    across_covs = {}
+    across_covs = {'MHC class I':0, 'MHC class II':0}
     for mhc in coverages:
         covs = list(coverages[mhc].values())
 
@@ -239,11 +281,10 @@ def assign_epitope_coverage(epidict, hlaref, genlist, use_pheno, mingencov):
 
         # coverage per peptide
         covered_hlas = epidict[pep]['hlaset']
-
         coverages, across_covs = calculate_hla_coverage(covered_hlas, hlaref)
 
-        epidict[pep]['hlacov_I'] = round(across_covs['MHC Class I'], 4)
-        epidict[pep]['hlacov_II'] = round(across_covs['MHC Class II'], 4)
+        epidict[pep]['hlacov_I'] = round(across_covs['MHC class I'], 4)
+        epidict[pep]['hlacov_II'] = round(across_covs['MHC class II'], 4)
 
         # Initial score
         epidict[pep]['i_score'] = round((epidict[pep]['hlacov_I'] + epidict[pep]['hlacov_II'])*epidict[pep]['nhitg'], 4)
@@ -253,7 +294,7 @@ def assign_epitope_coverage(epidict, hlaref, genlist, use_pheno, mingencov):
     # apply minimum coverage criteria
     if mingencov != 0.0:
         epidict = {key:value for key,value in epidict.items() if value['nhitg']/len(genlist) >= mingencov}
-        print("Got %d peptides after applying genomic coverage threshold of %s." % (len(epidict), str(mingencov)))
+        print(f"Got {len(epidict)} peptides after applying genomic coverage threshold of {mingencov}")
 
     return epidict
 
@@ -261,17 +302,15 @@ def assign_epitope_coverage(epidict, hlaref, genlist, use_pheno, mingencov):
 def score_peptides(epidict, hlaref, hla_gen_cov, beta, use_pheno, sub, h_indices, g_indices):
     """ Assign score to each peptide for the current selection round and update the epitope dict"""
     for pep in epidict:
-
         score = 0
         for (hla, gen) in epidict[pep]['combos']:
+           
+            f = hlaref[hla]['phenofreq'] if use_pheno else hlaref[hla]['freq']
 
-            if 'phenofreq' in hlaref[hla]:
-                f = hlaref[hla]['phenofreq'] if use_pheno else hlaref[hla]['freq']
+            h = h_indices[hla]
+            g = g_indices[gen]
 
-                h = h_indices[hla]
-                g = g_indices[gen]
-
-                score += f / (hla_gen_cov[g][h] + beta - sub)
+            score += f / (hla_gen_cov[g][h] + beta - sub)
 
         epidict[pep]['score'] = round(score, 4)
 
@@ -321,9 +360,10 @@ def select_peptides(e, epidict, hlaref, hlalist, genlist, beta, use_pheno, metho
         hla_cov_matrix.append(hla_cov)
         gen_cov_matrix.append(gen_cov)
 
-        print("Selected %s " % best_pep)
-        print("HLA: ", ' '.join([str(n) for n in hla_cov]), '')
-        print("Genotype: ", ' '.join([str(n) for n in gen_cov]), '')
+        print(f"Selected {best_pep}")
+        print("HLA: ", ' '.join([str(n) for n in hla_cov]))
+        print("Genotype: ", ' '.join([str(n) for n in gen_cov]))
+
 
         # Update the (hla, gen) combi coverage values
         for (hla, gen) in pepdict['combos']:
@@ -351,30 +391,183 @@ def select_peptides(e, epidict, hlaref, hlalist, genlist, beta, use_pheno, metho
 
 def get_nmers(prot_file, n):
     """ Extract unique n-mer peptides from list of proteins"""
+
     nmers = set()
+    seq = ""
+    fasta_format = False
+
     with open(prot_file) as infile:
+
         for line in infile:
+
+            if not line.strip():
+                continue
+
             # Header
             if line.startswith('>'):
-                pass
+                fasta_format = True
+
+            if fasta_format:
+                if line.startswith('>'):
+                    if seq:
+                        for i in range(len(seq) - n + 1):
+                            nmer = seq[i:i+n]
+                            nmers.add(nmer)
+                    seq = ""
+
+                else:
+                    seq += line.strip().upper()
+
+            # Normal sequence format, one per line
             else:
-                seq = line.strip()
+                seq = line.strip().upper()
 
-                for i in range(len(seq)):
-                    if i < len(seq) - n + 1:
-                        nmer = seq[i:i+n]
-                        nmers.add(nmer)
+                for i in range(len(seq) - n + 1):
+                    nmer = seq[i:i+n]
+                    nmers.add(nmer)
+
+        # get nmers from the last sequence
+        if seq:
+            for i in range(len(seq) - n + 1):
+                nmer = seq[i:i+n]
+                nmers.add(nmer)
+
     return nmers
-
 
 def map_onto_nmers(epidict, mhc_dict):
     """ Map peptide binders onto pre-allocated nmer peptides"""
     for nmer in epidict:
-        for mhc in mhc_dict:
-            if mhc in nmer:
+        for pep in mhc_dict:
+            if pep in nmer:
                 for entry in ['hlaset', 'genset', 'combos', 'covset']:
-                    epidict[nmer][entry] = epidict[nmer][entry].union(mhc_dict[mhc][entry])
+                    epidict[nmer][entry] = epidict[nmer][entry].union(mhc_dict[pep][entry])
+
+                for i in (0,1):
+                    if mhc_dict[pep]['nested'][i] == 1:
+                        epidict[nmer]['nested'][i] = 1
     return epidict
+
+
+def build_locidict(hlaref):
+
+    loci_dict = {}
+
+    for hla in hlaref:
+        hla_class, locus = hlaref[hla]['class'], hlaref[hla]['locus']
+
+        if hla_class not in loci_dict:
+            loci_dict[hla_class] = {}
+
+        if locus not in loci_dict[hla_class]:
+            loci_dict[hla_class][locus] = {hla}
+        else:
+            loci_dict[hla_class][locus].add(hla)
+
+    return loci_dict
+
+def adjust_frequencies(hlaref, loci_dict):
+    """ Make frequencies sum to 1 per loci"""
+
+    for hla_class in loci_dict:
+        for locus in loci_dict[hla_class]:
+            f_sum = sum(hlaref[hla]['freq'] for hla in loci_dict[hla_class][locus])
+
+            if f_sum > 1:
+                for hla in loci_dict[hla_class][locus]:
+                    hlaref[hla]['freq'] /= f_sum
+
+            elif f_sum < 1:
+                loci_dict[hla_class][locus].add(f'UNKNOWN_{locus}')
+                hlaref[f'UNKNOWN_{locus}'] =  {'freq':1-f_sum, 'hits':0}
+
+    return hlaref, loci_dict
+
+def calculate_epitope_hits(epitope_dict, hlaref):
+    """Calculate how many epitopes covers each allele"""
+    for epitope in epitope_dict:
+        for hla in epitope_dict[epitope]:
+            hlaref[hla]['hits'] += 1
+
+    return hlaref
+
+def frequency_distribution(loci_dict, hlaref):
+    """ For each pair of alleles, calculate their combined epitope hit count and combined frequency
+    We then sum the frequencies over the allele pairs with the same hit count, and store them in tabulation_dict
+    """
+    tabulation_dict = {}
+
+    for hla_class in loci_dict:
+        class_dict = {}
+
+        for locus in loci_dict[hla_class]:
+            class_dict[locus] = {}
+
+            alleles = list(loci_dict[hla_class][locus])
+
+            for hla_i in alleles:
+                i_hits, i_freq = hlaref[hla_i]['hits'], hlaref[hla_i]['freq']
+
+                for hla_j in alleles:
+                    j_hits, j_freq = hlaref[hla_j]['hits'], hlaref[hla_j]['freq']
+
+                    if hla_i == hla_j:
+                        total_hit = i_hits
+                    else:
+                        total_hit = i_hits + j_hits
+
+                    # phenotypic frequency
+                    phenofreq = i_freq * j_freq
+
+                    if total_hit not in class_dict[locus]:
+                        class_dict[locus][total_hit] = phenofreq
+                    else:
+                        class_dict[locus][total_hit] += phenofreq
+
+        tabulation_dict[hla_class] = class_dict
+
+    return tabulation_dict
+
+def merge_loci(merged_dict, locus_dict):
+    """locus_dict is the current loci hit-count/freq map
+    to merge onto the current loci(s) """
+    merged_locus = {}
+    for hit1, freq1 in merged_dict.items():
+        for hit2, freq2 in locus_dict.items():
+            total_hit = hit1 + hit2
+            total_frequency = freq1 * freq2
+            if total_hit not in merged_locus:
+                merged_locus[total_hit] = total_frequency
+            else:
+                merged_locus[total_hit] += total_frequency
+
+    return merged_locus
+
+
+def iedb_coverage(tabulation_dict):
+
+    coverages = {'MHC class I':{}, 'MHC class II':{}}
+    across_covs = {'MHC class I':0, 'MHC class II':0}
+
+    # Merge loci for each MHC class
+    for mhc_class in tabulation_dict:
+
+        mhc = 'MHC class I' if mhc_class == 1 else 'MHC class II'
+        loci = list(tabulation_dict[mhc_class].keys())
+
+        for locus in loci:
+            cov = sum(tabulation_dict[mhc_class][locus][h] for h in tabulation_dict[mhc_class][locus] if h > 0)
+            coverages[mhc][locus] = cov
+
+        merged_dict = tabulation_dict[mhc_class][loci[0]]
+
+        for locus in loci[1:]:
+            locus_dict = tabulation_dict[mhc_class][locus]
+            merged_dict = merge_loci(merged_dict, locus_dict)
+
+        coverage = sum(merged_dict[h] for h in merged_dict if h > 0)
+        across_covs[mhc] = coverage
+
+    return coverages, across_covs
 
 
 def main(args, parser):
@@ -387,12 +580,20 @@ def main(args, parser):
     # Booleans
     mhc1_no_cores = args.p_noco1
     mhc2_no_cores = args.p_noco2
+
     use_pheno = args.p_phenofreq
     nore = args.p_nore
     submin = args.p_submin
 
     # popcover, s_ini or random
     method = args.p_method
+
+    req1 = 1 if args.p_req1 and mhc1_file else 0
+    req2 = 1 if args.p_req2 and mhc2_file else 0
+
+    iedb = args.p_iedb
+
+    nested_classes = (req1, req2)
 
     try:
         mingencov = float(args.p_mingencov)
@@ -415,7 +616,7 @@ def main(args, parser):
 
     # Show parameters
     arg_strings = ["p_ne", "p_nmer", "p_nset", "p_beta", "p_mingencov", "p_submin", "p_noco1", "p_noco2",
-            "p_phenofreq", "p_nore", "p_method"]
+            "p_phenofreq", "p_nore", "p_method", "p_req1", "p_req2", "p_iedb"]
 
     arg_dict = {}
     for item in vars(parser)['_actions']:
@@ -441,9 +642,9 @@ def main(args, parser):
     if prot_file:
         all_nmers = get_nmers(prot_file, plen)
 
-        print("Got %d unique %d-mer peptides from input protein sequences " % (len(all_nmers), plen))
+        print(f"Got {len(all_nmers)} unique {plen}-mer peptides from input protein sequences")
 
-        epidict = {n:{'hlaset':set(), 'genset':set(), 'combos':set(), 'covset':set()} for n in all_nmers}
+        epidict = {n:{'hlaset':set(), 'genset':set(), 'combos':set(), 'covset':set(), 'nested':[0,0]} for n in all_nmers}
     else:
         epidict = {}
 
@@ -462,8 +663,8 @@ def main(args, parser):
     genlist = sorted(list(set(genlist_1 + genlist_2)))
 
     print("-- MHC binder data --")
-    print("Got %d alleles " % len(hlalist))
-    print("Got %d genotypes " % len(genlist))
+    print(f"Got {len(hlalist)} alleles")
+    print(f"Got {len(genlist)} genotypes")
     print("")
 
     # Preallocate hla and genotype indexes for easy lookup of matrix values
@@ -483,10 +684,10 @@ def main(args, parser):
             epidict = map_onto_nmers(epidict, mhc1_dict)
 
         # Remove "empty" epitopes
-        for pep in [p for p in epidict]:
-            if epidict[pep] == {'hlaset':set(), 'genset':set(), 'combos':set(), 'covset':set()}:
+        for pep in [pep for pep in epidict]:
+            if epidict[pep] == {'hlaset':set(), 'genset':set(), 'combos':set(), 'covset':set(), 'nested':[0,0]}:
                 del epidict[pep]
-        print("Got %d unique %d-mer peptides with nested HLA binders " % (len(epidict), plen))
+        print(f"Got {len(epidict)} unique {plen}-mer peptides with nested HLA binders")
         print("")
 
         if not nore:
@@ -509,7 +710,7 @@ def main(args, parser):
 
     if e > len(epidict):
         e = min([5, len(epidict)])
-        print("Error: reduced dataset has less than amount of peptides to select. Defaulting to {}.".format(e))
+        print(f"Error: reduced dataset has less than amount of peptides to select. Defaulting to {e}.")
 
 
     epidict = assign_epitope_coverage(epidict, hlaref, genlist, use_pheno, mingencov)
@@ -523,9 +724,22 @@ def main(args, parser):
         print("Error: beta has to be bigger than 0. Setting to 0.01 by default.")
         beta = 0.01
 
-    print('HLA: ', ' '.join(hlalist), '')
+
+    # Apply nested class peptide filter
+    if nested_classes != (0,0):
+        epidict = {pep:epidict[pep] for pep in epidict if not any(epidict[pep]['nested'][i] == 0 and nested_classes[i] == 1 for i in range(2))}
+
+        class_string = []
+        for i, cl in enumerate(["I","II"]):
+            if nested_classes[i] == 1:
+                class_string.append(cl)
+
+        print("Got {} unique peptides with nested class {} binders".format(len(epidict), " & ".join(class_string)))
+
+
+    print('HLA: ', ' '.join(hlalist))
     print('')
-    print('Genotypes: ', ' '.join(genlist), '')
+    print('Genotypes: ', ' '.join(genlist))
 
     for set_n in range(1, nset + 1):
         print("")
@@ -543,26 +757,56 @@ def main(args, parser):
         print('\n'.join(format_row.format(*r) for r in rows))
         print("")
 
+        # Take last rows of accumulative count matrices
         hla_cov = hla_cov_matrix[-1]
-        covered_hlas = [hla for i, hla in enumerate(hlalist) if hla_cov[i] > 0]
+        gen_cov = gen_cov_matrix[-1]
 
-        # Calculating coverage    
-        coverages, across_covs = calculate_hla_coverage(covered_hlas, hlaref)
+        # Use the iEDB coverage method
+        if iedb:
+            method = "IEDB"
 
-        coverage_lines = ["-- Locus coverage --"]
+            loci_dict = build_locidict(hlaref)
+            epitope_dict = {pep:sel_peps[pep]['hlaset'] for pep in sel_peps}
 
-        for mhc in coverages:
+            hlaref = calculate_epitope_hits(epitope_dict, hlaref)
+            hlaref, loci_dict = adjust_frequencies(hlaref, loci_dict)
 
+            tabulation_dict = frequency_distribution(loci_dict, hlaref)
+            coverages, across_covs = iedb_coverage(tabulation_dict)
+
+        # Use the standard PopCover coverage method
+        else:
+            method = "PopCover"
+            covered_hlas = [hla for i, hla in enumerate(hlalist) if hla_cov[i] > 0]
+            # Calculating coverage
+            coverages, across_covs = calculate_hla_coverage(covered_hlas, hlaref)
+
+        print(f"Population coverage - {method} method")
+        print("")
+        coverage_lines = []
+
+        for mhc in sorted(coverages):
             if coverages[mhc]:
-                coverage_lines.append("{}".format(mhc))
+                coverage_lines.append(mhc)
 
                 for locus in coverages[mhc]:
-                    coverage_lines.append("Locus {} has coverage {} ".format(locus, round(coverages[mhc][locus], 8)))
+                    coverage_lines.append(f"Locus {locus} has coverage {round(coverages[mhc][locus], 4)}")
 
-                coverage_lines.append("Coverage across loci in {}: {}".format(mhc, round(across_covs[mhc], 8)))
-                coverage_lines.append("")
+                coverage_lines.append(f"Coverage across loci in {mhc}: {round(across_covs[mhc], 4)}")
         print('\n'.join(coverage_lines))
+        print("")
 
+        # Other metrics
+        print("-- Number of covering peptides per allele --")
+        for hla, count in zip(hlalist, hla_cov):
+            print(hla, count )
+        print("")
+
+        print("-- Number of covering peptides per genotype--")
+        for gen, count in zip(genlist, gen_cov):
+            print(gen, count )
+        print("")
+  
 
 if __name__=='__main__':
     args, parser = get_args()
